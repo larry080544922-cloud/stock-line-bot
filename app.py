@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from flask import Flask, request, abort
 from FinMind.data import DataLoader
@@ -17,10 +18,10 @@ LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', 'YOUR_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 判斷連續買賣超天數的輔助函式
+# 輔助函式：計算連續買賣超天數
 def get_consecutive_days(series):
     if series.empty:
-        return 0, ""
+        return 0, "無資料"
     last_val = series.iloc[-1]
     if last_val == 0:
         return 0, "無買賣"
@@ -35,6 +36,27 @@ def get_consecutive_days(series):
     action = "連買" if is_buy else "連賣"
     return count, action
 
+# 輔助函式：計算 KD 指標
+def calculate_kd(df, n=9):
+    try:
+        low_list = df['low'].rolling(window=n, min_periods=n).min()
+        high_list = df['high'].rolling(window=n, min_periods=n).max()
+        rsv = (df['close'] - low_list) / (high_list - low_list) * 100
+        
+        k = [50.0]
+        d = [50.0]
+        for r in rsv[n-1:]:
+            if pd.isna(r):
+                r = 50.0
+            k_val = (2/3) * k[-1] + (1/3) * r
+            d_val = (2/3) * d[-1] + (1/3) * k_val
+            k.append(k_val)
+            d.append(d_val)
+        
+        return round(k[-1], 1), round(d[-1], 1)
+    except Exception:
+        return "N/A", "N/A"
+
 def get_stock_report(stock_id):
     dl = DataLoader()
     start_date = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -47,13 +69,11 @@ def get_stock_report(stock_id):
             stock_name = matched.iloc[0]['stock_name']
             category = matched.iloc[0]['industry_category']
         else:
-            stock_name = "未知"
-            category = "其他 / 待確定"
+            stock_name, category = "未知", "其他 / 待確定"
     except Exception:
-        stock_name = "股票"
-        category = "其他 / 待確定"
+        stock_name, category = "股票", "其他 / 待確定"
 
-    # 2. 日K線價格與均線計算 (5MA, 20MA, 60MA)
+    # 2. 日K線價格、均線、乖離率、KD計算
     try:
         df_price = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date)
         if not df_price.empty:
@@ -61,52 +81,82 @@ def get_stock_report(stock_id):
             close_price = df_price.iloc[-1]['close']
             volume = df_price.iloc[-1]['Trading_Volume'] // 1000
             
-            # 計算均線
+            # 均線
             df_price['5MA'] = df_price['close'].rolling(5).mean()
             df_price['20MA'] = df_price['close'].rolling(20).mean()
             df_price['60MA'] = df_price['close'].rolling(60).mean()
             
-            ma5 = round(df_price.iloc[-1]['5MA'], 1) if pd.notnull(df_price.iloc[-1]['5MA']) else "N/A"
-            ma20 = round(df_price.iloc[-1]['20MA'], 1) if pd.notnull(df_price.iloc[-1]['20MA']) else "N/A"
-            ma60 = round(df_price.iloc[-1]['60MA'], 1) if pd.notnull(df_price.iloc[-1]['60MA']) else "N/A"
+            ma5_val = df_price.iloc[-1]['5MA']
+            ma20_val = df_price.iloc[-1]['20MA']
+            ma60_val = df_price.iloc[-1]['60MA']
             
-            # 判斷均線狀態
+            ma5 = round(ma5_val, 1) if pd.notnull(ma5_val) else "N/A"
+            ma20 = round(ma20_val, 1) if pd.notnull(ma20_val) else "N/A"
+            ma60 = round(ma60_val, 1) if pd.notnull(ma60_val) else "N/A"
+            
+            # 5MA 乖離率
+            bias_5 = round(((close_price - ma5_val) / ma5_val) * 100, 1) if pd.notnull(ma5_val) else "N/A"
+            
+            # 均線型態
             if ma5 != "N/A" and ma20 != "N/A" and ma60 != "N/A":
-                if close_price > ma5 > ma20 > ma60:
+                if close_price > ma5_val > ma20_val > ma60_val:
                     status = "多頭排列 🚀"
-                elif close_price < ma5 < ma20 < ma60:
+                elif close_price < ma5_val < ma20_val < ma60_val:
                     status = "空頭排列 📉"
                 else:
                     status = "均線震盪中 ⚖️"
             else:
                 status = "資料不足 ⚖️"
+                
+            # KD 計算
+            k_val, d_val = calculate_kd(df_price)
+            kd_str = f"K {k_val} / D {d_val}"
+            if k_val != "N/A":
+                if k_val > 80:
+                    kd_str += " (超買區 🔥)"
+                elif k_val < 20:
+                    kd_str += " (超賣區 ❄️)"
         else:
             data_date, close_price, volume = datetime.now().strftime("%Y-%m-%d"), "N/A", "N/A"
-            ma5, ma20, ma60, status = "N/A", "N/A", "N/A", "資料不足"
+            ma5, ma20, ma60, status, bias_5, kd_str = "N/A", "N/A", "N/A", "資料不足", "N/A", "N/A"
     except Exception:
         data_date, close_price, volume = datetime.now().strftime("%Y-%m-%d"), "N/A", "N/A"
-        ma5, ma20, ma60, status = "N/A", "N/A", "N/A", "資料不足"
+        ma5, ma20, ma60, status, bias_5, kd_str = "N/A", "N/A", "N/A", "資料不足", "N/A", "N/A"
 
-    # 3. 三大法人買賣超與連續買賣天數計算
+    # 3. 本益比 / 殖利率 / 股價淨值比
+    try:
+        df_per = dl.taiwan_stock_per_pbr(stock_id=stock_id, start_date=start_date)
+        if not df_per.empty:
+            pe = df_per.iloc[-1].get('PER', 'N/A')
+            pb = df_per.iloc[-1].get('PBR', 'N/A')
+            dy = df_per.iloc[-1].get('dividend_yield', 'N/A')
+            
+            pe_str = f"{round(pe, 1)} 倍" if pd.notnull(pe) and pe != 0 else "N/A"
+            pb_str = f"{round(pb, 1)} 倍" if pd.notnull(pb) and pb != 0 else "N/A"
+            dy_str = f"{round(dy, 2)} %" if pd.notnull(dy) and dy != 0 else "N/A"
+        else:
+            pe_str, pb_str, dy_str = "N/A", "N/A", "N/A"
+    except Exception:
+        pe_str, pb_str, dy_str = "N/A", "N/A", "N/A"
+
+    # 4. 三大法人與籌碼狀態
+    sync_status = ""
+    sync_days = 0
     try:
         df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
         if not df_chip.empty:
-            # 依日期與法人名稱整理買賣超張數 (淨買賣量 = buy - sell)
             df_chip['net_buy'] = (df_chip['buy'] - df_chip['sell']) // 1000
             
-            # 區分三大法人種類
             foreign_df = df_chip[df_chip['name'].str.contains('Foreign')].groupby('date')['net_buy'].sum()
             trust_df = df_chip[df_chip['name'].str.contains('Investment_Trust')].groupby('date')['net_buy'].sum()
             dealer_df = df_chip[df_chip['name'].str.contains('Dealer')].groupby('date')['net_buy'].sum()
             total_df = foreign_df.add(trust_df, fill_value=0).add(dealer_df, fill_value=0)
             
-            # 最新一日數據
             foreign_today = int(foreign_df.iloc[-1]) if not foreign_df.empty else 0
             trust_today = int(trust_df.iloc[-1]) if not trust_df.empty else 0
             dealer_today = int(dealer_df.iloc[-1]) if not dealer_df.empty else 0
             total_today = int(total_df.iloc[-1]) if not total_df.empty else 0
             
-            # 計算連續天數
             f_cnt, f_act = get_consecutive_days(foreign_df)
             t_cnt, t_act = get_consecutive_days(trust_df)
             d_cnt, d_act = get_consecutive_days(dealer_df)
@@ -116,11 +166,7 @@ def get_stock_report(stock_id):
             dealer_str = f"{dealer_today:+d} 張 ({d_act} {d_cnt} 天)"
             total_str = f"{total_today:+d} 張"
             
-            # 判斷是否「三大法人同步買超 / 賣超」
-            sync_status = ""
             if foreign_today > 0 and trust_today > 0 and dealer_today > 0:
-                # 計算同步買超連續天數
-                sync_days = 0
                 for f, t, d in zip(reversed(foreign_df), reversed(trust_df), reversed(dealer_df)):
                     if f > 0 and t > 0 and d > 0:
                         sync_days += 1
@@ -128,7 +174,6 @@ def get_stock_report(stock_id):
                         break
                 sync_status = f"\n🔥 法人籌碼：三大法人同步買超 {sync_days} 天 🚀"
             elif foreign_today < 0 and trust_today < 0 and dealer_today < 0:
-                sync_days = 0
                 for f, t, d in zip(reversed(foreign_df), reversed(trust_df), reversed(dealer_df)):
                     if f < 0 and t < 0 and d < 0:
                         sync_days += 1
@@ -136,11 +181,32 @@ def get_stock_report(stock_id):
                         break
                 sync_status = f"\n⚠️ 法人籌碼：三大法人同步賣超 {sync_days} 天 📉"
         else:
-            foreign_str, trust_str, dealer_str, total_str, sync_status = "N/A", "N/A", "N/A", "N/A", ""
+            foreign_str, trust_str, dealer_str, total_str = "N/A", "N/A", "N/A", "N/A"
     except Exception:
-        foreign_str, trust_str, dealer_str, total_str, sync_status = "N/A", "N/A", "N/A", "N/A", ""
+        foreign_str, trust_str, dealer_str, total_str = "N/A", "N/A", "N/A", "N/A"
 
-    # 4. 月營收
+    # 5. 千張大戶持股比
+    try:
+        df_large = dl.taiwan_stock_holding_shares_per(stock_id=stock_id, start_date=start_date)
+        if not df_large.empty:
+            df_1000 = df_large[df_large['HoldingSharesLevel'] == '15']
+            if len(df_1000) >= 2:
+                latest_ratio = df_1000.iloc[-1]['percent']
+                prev_ratio = df_1000.iloc[-2]['percent']
+                diff = round(latest_ratio - prev_ratio, 2)
+                diff_str = f" (較上週 {diff:+.2f}%)"
+            elif len(df_1000) == 1:
+                latest_ratio = df_1000.iloc[-1]['percent']
+                diff_str = ""
+            else:
+                latest_ratio, diff_str = "N/A", ""
+            large_holder_str = f"{latest_ratio:.2f} %{diff_str}" if isinstance(latest_ratio, (int, float)) else "N/A"
+        else:
+            large_holder_str = "N/A"
+    except Exception:
+        large_holder_str = "N/A"
+
+    # 6. 月營收
     try:
         df_rev = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date="2025-01-01")
         if not df_rev.empty:
@@ -151,20 +217,45 @@ def get_stock_report(stock_id):
     except Exception:
         rev_str = "N/A"
 
-    # 5. 組合發送報告
-    report_text = f"""📈 【{stock_id} {stock_name}】綜合分析
+    # 7. 智慧重點總結
+    summary_list = []
+    if status == "多頭排列 🚀":
+        summary_list.append("‧ 趨勢多頭，均線呈多頭排列 🚀")
+    elif status == "空頭排列 📉":
+        summary_list.append("‧ 趨勢偏弱，均線呈空頭排列 📉")
+        
+    if sync_days > 0 and foreign_today > 0:
+        summary_list.append(f"‧ 三大法人已連續同步買超 {sync_days} 天，籌碼偏多！")
+    elif sync_days > 0 and foreign_today < 0:
+        summary_list.append(f"‧ 三大法人已連續同步賣超 {sync_days} 天，注意調節風險！")
+        
+    if isinstance(bias_5, (int, float)) and bias_5 > 6:
+        summary_list.append(f"‧ 5MA 乖離率達 +{bias_5}%，短線留意回檔風險 ⚠️")
+        
+    summary_text = "\n".join(summary_list) if summary_list else "‧ 短線區間震盪整理中 ⚖️"
+
+    # 8. 組合最終報告
+    report_text = f"""📈 【{stock_id} {stock_name}】綜合健檢報告
 🗓️ 資料日期：{data_date}
 🏷️ 產業族群：{category}
 ----------------------------------------
+💡 一秒重點總結
+{summary_text}
+
 💰 行情與估值
 ‧ 收盤價：{close_price} 元
 ‧ 成交量：{volume:,} 張
+‧ 本益比 (PE)：{pe_str}
+‧ 股價淨值比 (PB)：{pb_str}
+‧ 殖利率：{dy_str}
 
-📊 技術面 (均線位置)
+📊 技術面 (均線與指標)
 ‧ 5MA：{ma5} 元
 ‧ 20MA：{ma20} 元
 ‧ 60MA：{ma60} 元
-‧ 狀態：{status}
+‧ 均線型態：{status}
+‧ 5MA 乖離率：{f'{bias_5:+.1f}%' if isinstance(bias_5, (int, float)) else 'N/A'}
+‧ KD 指標：{kd_str}
 
 📑 基本面 (月營收)
 ‧ 單月營收：{rev_str}
@@ -173,7 +264,10 @@ def get_stock_report(stock_id):
 ‧ 外資：{foreign_str}
 ‧ 投信：{trust_str}
 ‧ 自營商：{dealer_str}
-‧ 法人合計：{total_str}{sync_status}"""
+‧ 法人合計：{total_str}{sync_status}
+
+👑 千張大戶持股 (最新週)
+‧ 持股比例：{large_holder_str}"""
 
     return report_text
 
