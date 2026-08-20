@@ -17,6 +17,24 @@ LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET', 'YOUR_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# 判斷連續買賣超天數的輔助函式
+def get_consecutive_days(series):
+    if series.empty:
+        return 0, ""
+    last_val = series.iloc[-1]
+    if last_val == 0:
+        return 0, "無買賣"
+    
+    is_buy = last_val > 0
+    count = 0
+    for val in reversed(series):
+        if (is_buy and val > 0) or (not is_buy and val < 0):
+            count += 1
+        else:
+            break
+    action = "連買" if is_buy else "連賣"
+    return count, action
+
 def get_stock_report(stock_id):
     dl = DataLoader()
     start_date = (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -69,31 +87,64 @@ def get_stock_report(stock_id):
         data_date, close_price, volume = datetime.now().strftime("%Y-%m-%d"), "N/A", "N/A"
         ma5, ma20, ma60, status = "N/A", "N/A", "N/A", "資料不足"
 
-    # 3. 三大法人買賣超 (最新日)
+    # 3. 三大法人買賣超與連續買賣天數計算
     try:
         df_chip = dl.taiwan_stock_institutional_investors(stock_id=stock_id, start_date=start_date)
         if not df_chip.empty:
-            latest_chip_date = df_chip.iloc[-1]['date']
-            df_latest_chip = df_chip[df_chip['date'] == latest_chip_date]
+            # 依日期與法人名稱整理買賣超張數 (淨買賣量 = buy - sell)
+            df_chip['net_buy'] = (df_chip['buy'] - df_chip['sell']) // 1000
             
-            foreign = df_latest_chip[df_latest_chip['name'].str.contains('Foreign')]['buy'].sum() - df_latest_chip[df_latest_chip['name'].str.contains('Foreign')]['sell'].sum()
-            trust = df_latest_chip[df_latest_chip['name'].str.contains('Investment_Trust')]['buy'].sum() - df_latest_chip[df_latest_chip['name'].str.contains('Investment_Trust')]['sell'].sum()
-            dealer = df_latest_chip[df_latest_chip['name'].str.contains('Dealer')]['buy'].sum() - df_latest_chip[df_latest_chip['name'].str.contains('Dealer')]['sell'].sum()
+            # 區分三大法人種類
+            foreign_df = df_chip[df_chip['name'].str.contains('Foreign')].groupby('date')['net_buy'].sum()
+            trust_df = df_chip[df_chip['name'].str.contains('Investment_Trust')].groupby('date')['net_buy'].sum()
+            dealer_df = df_chip[df_chip['name'].str.contains('Dealer')].groupby('date')['net_buy'].sum()
+            total_df = foreign_df.add(trust_df, fill_value=0).add(dealer_df, fill_value=0)
             
-            foreign_str = f"{foreign // 1000:+d}"
-            trust_str = f"{trust // 1000:+d}"
-            dealer_str = f"{dealer // 1000:+d}"
-            total_str = f"{(foreign + trust + dealer) // 1000:+d}"
+            # 最新一日數據
+            foreign_today = int(foreign_df.iloc[-1]) if not foreign_df.empty else 0
+            trust_today = int(trust_df.iloc[-1]) if not trust_df.empty else 0
+            dealer_today = int(dealer_df.iloc[-1]) if not dealer_df.empty else 0
+            total_today = int(total_df.iloc[-1]) if not total_df.empty else 0
+            
+            # 計算連續天數
+            f_cnt, f_act = get_consecutive_days(foreign_df)
+            t_cnt, t_act = get_consecutive_days(trust_df)
+            d_cnt, d_act = get_consecutive_days(dealer_df)
+            
+            foreign_str = f"{foreign_today:+d} 張 ({f_act} {f_cnt} 天)"
+            trust_str = f"{trust_today:+d} 張 ({t_act} {t_cnt} 天)"
+            dealer_str = f"{dealer_today:+d} 張 ({d_act} {d_cnt} 天)"
+            total_str = f"{total_today:+d} 張"
+            
+            # 判斷是否「三大法人同步買超 / 賣超」
+            sync_status = ""
+            if foreign_today > 0 and trust_today > 0 and dealer_today > 0:
+                # 計算同步買超連續天數
+                sync_days = 0
+                for f, t, d in zip(reversed(foreign_df), reversed(trust_df), reversed(dealer_df)):
+                    if f > 0 and t > 0 and d > 0:
+                        sync_days += 1
+                    else:
+                        break
+                sync_status = f"\n🔥 法人籌碼：三大法人同步買超 {sync_days} 天 🚀"
+            elif foreign_today < 0 and trust_today < 0 and dealer_today < 0:
+                sync_days = 0
+                for f, t, d in zip(reversed(foreign_df), reversed(trust_df), reversed(dealer_df)):
+                    if f < 0 and t < 0 and d < 0:
+                        sync_days += 1
+                    else:
+                        break
+                sync_status = f"\n⚠️ 法人籌碼：三大法人同步賣超 {sync_days} 天 📉"
         else:
-            foreign_str, trust_str, dealer_str, total_str = "N/A", "N/A", "N/A", "N/A"
+            foreign_str, trust_str, dealer_str, total_str, sync_status = "N/A", "N/A", "N/A", "N/A", ""
     except Exception:
-        foreign_str, trust_str, dealer_str, total_str = "N/A", "N/A", "N/A", "N/A"
+        foreign_str, trust_str, dealer_str, total_str, sync_status = "N/A", "N/A", "N/A", "N/A", ""
 
     # 4. 月營收
     try:
         df_rev = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date="2025-01-01")
         if not df_rev.empty:
-            rev_val = df_rev.iloc[-1]['revenue'] // 1000  # 轉千元或百萬
+            rev_val = df_rev.iloc[-1]['revenue'] // 1000
             rev_str = f"{rev_val:,} 千元"
         else:
             rev_str = "N/A"
@@ -119,10 +170,10 @@ def get_stock_report(stock_id):
 ‧ 單月營收：{rev_str}
 
 🏛️ 三大法人買賣超 (最新日)
-‧ 外資：{foreign_str} 張
-‧ 投信：{trust_str} 張
-‧ 自營商：{dealer_str} 張
-‧ 法人合計：{total_str} 張"""
+‧ 外資：{foreign_str}
+‧ 投信：{trust_str}
+‧ 自營商：{dealer_str}
+‧ 法人合計：{total_str}{sync_status}"""
 
     return report_text
 
